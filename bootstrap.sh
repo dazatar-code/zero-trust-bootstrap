@@ -1,5 +1,6 @@
 ########## FILE: bootstrap.sh (place in zero-trust-bootstrap/) ##########
 #!/usr/bin/env bash
+exit 0  # QUARANTINED - Recovery in progress
 set -euo pipefail
 
 # PR‑first, default‑branch aware bootstrap
