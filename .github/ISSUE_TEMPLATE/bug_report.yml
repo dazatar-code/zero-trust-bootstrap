@@ -1,0 +1,25 @@
+name: 🐛 Bug Report
+description: Report a reproducible defect
+title: "[BUG] "
+labels: [bug, triage]
+body:
+  - type: textarea
+    id: context
+    attributes: { label: Context, description: Environment/branch }
+    validations: { required: true }
+  - type: textarea
+    id: steps
+    attributes: { label: Steps to Reproduce }
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes: { label: Expected vs Actual }
+    validations: { required: true }
+  - type: textarea
+    id: verification
+    attributes: { label: Verification, description: Link to failing CI/test }
+    validations: { required: true }
+  - type: textarea
+    id: acceptance
+    attributes: { label: Acceptance Criteria }
+    validations: { required: true }

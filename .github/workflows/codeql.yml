@@ -1,0 +1,15 @@
+name: CodeQL
+on:
+  push:
+    branches: [ "main", "**" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '33 2 * * 3'
+jobs:
+  analyze:
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    uses: github/codeql-action/.github/workflows/codeql.yml@v3

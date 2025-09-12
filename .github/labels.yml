@@ -1,0 +1,24 @@
+- name: bug
+  color: d73a4a
+  description: "Something isn’t working"
+- name: feature
+  color: a2eeef
+  description: "New functionality"
+- name: task
+  color: 0366d6
+  description: "Small unit of work"
+- name: security
+  color: ff0000
+  description: "Security-related issue"
+- name: documentation
+  color: 0075ca
+  description: "Docs-only updates"
+- name: blocked
+  color: 000000
+  description: "Work blocked by dependency"
+- name: needs-spec
+  color: fbca04
+  description: "Proposal requires more detail"
+- name: triage
+  color: cfd3d7
+  description: "Needs investigation"

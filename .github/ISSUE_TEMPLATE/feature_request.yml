@@ -1,0 +1,25 @@
+name: 🚀 Feature Request
+description: Propose a new feature
+title: "[FEAT] "
+labels: [feature, needs-spec]
+body:
+  - type: textarea
+    id: problem
+    attributes: { label: Problem Statement }
+    validations: { required: true }
+  - type: textarea
+    id: solution
+    attributes: { label: Proposed Solution }
+    validations: { required: true }
+  - type: textarea
+    id: impact
+    attributes: { label: Impact/Tradeoffs }
+    validations: { required: true }
+  - type: textarea
+    id: verification
+    attributes: { label: Verification, description: CI/tests that prove it works }
+    validations: { required: true }
+  - type: textarea
+    id: acceptance
+    attributes: { label: Acceptance Criteria }
+    validations: { required: true }

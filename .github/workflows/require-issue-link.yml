@@ -1,0 +1,14 @@
+name: Require Issue Link
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+jobs:
+  check-issue-link:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce Issue link
+        run: |
+          if ! grep -qiE "(Fixes|Closes) #[0-9]+" <<< "${{ github.event.pull_request.body }}"; then
+            echo "❌ PR must link to an Issue (e.g., Fixes #1)"
+            exit 1
+          fi

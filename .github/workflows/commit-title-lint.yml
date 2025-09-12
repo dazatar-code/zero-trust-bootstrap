@@ -1,0 +1,15 @@
+name: Conventional Commit Title
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+jobs:
+  lint-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR title
+        run: |
+          TITLE="${{ github.event.pull_request.title }}"
+          if [[ ! "$TITLE" =~ ^(feat|fix|chore|docs|refactor|test|perf|ci|build|revert)(\(.+\))?:\  ]]; then
+            echo "❌ PR title must follow Conventional Commits"
+            exit 1
+          fi

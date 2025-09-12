@@ -1,0 +1,23 @@
+name: 📋 Task
+description: Track a small unit of work
+title: "[TASK] "
+labels: [task]
+body:
+  - type: textarea
+    id: objective
+    attributes: { label: Objective }
+    validations: { required: true }
+  - type: textarea
+    id: context
+    attributes: { label: Context/Dependencies }
+  - type: textarea
+    id: steps
+    attributes: { label: Planned Steps }
+  - type: textarea
+    id: verification
+    attributes: { label: Verification, description: Evidence of completion }
+    validations: { required: true }
+  - type: textarea
+    id: acceptance
+    attributes: { label: Acceptance Criteria }
+    validations: { required: true }
