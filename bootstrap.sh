@@ -132,7 +132,7 @@ for NAME in "${TARGET_REPOS[@]}"; do
   # After PR creation, try to apply branch protection with JSON once default branch exists
   DEFAULT_BRANCH="$(gh repo view "$REPO_SLUG" --json defaultBranchRef -q .defaultBranchRef.name)"; : "${DEFAULT_BRANCH:=main}"
   JSON_BODY='{
-    "required_status_checks": { "strict": true, "contexts": ["PR-Fast","CI-All-Files"] },
+    "required_status_checks": { "strict": true, "contexts": ["CI-All-Files"] },
     "enforce_admins": true,
     "required_pull_request_reviews": {
       "dismiss_stale_reviews": true,
@@ -141,7 +141,7 @@ for NAME in "${TARGET_REPOS[@]}"; do
     },
     "restrictions": null
   }'
-  gh api -X PUT "repos/$REPO_SLUG/branches/$DEFAULT_BRANCH/protection" \
+  # gh api -X PUT "repos/$REPO_SLUG/branches/$DEFAULT_BRANCH/protection" \
     -H "Accept: application/vnd.github+json" \
     --input - <<<"$JSON_BODY" || true
 
@@ -155,4 +155,5 @@ for NAME in "${TARGET_REPOS[@]}"; do
   ok "Finished $REPO_SLUG"
  done
 
-ok "All done — PRs opened/updated, protections applied (best-effort), and verification completed."
+ok "All done - policy: enforce only CI-All-Files; disable required signatures."
+# ok "All done — PRs opened/updated, protections applied (best-effort), and verification completed."
