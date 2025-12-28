@@ -1,0 +1,198 @@
+name: Tor CDP Firefox
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action: search, navigate'
+        required: true
+        default: 'search'
+      url:
+        description: 'URL or search query'
+        required: true
+      wait_ms:
+        description: 'Wait time in ms'
+        required: false
+        default: '8000'
+
+jobs:
+  firefox-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install Tor
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tor
+          sudo service tor start
+          
+          echo "⏳ Waiting for Tor..."
+          for i in {1..60}; do
+            if curl -s --socks5-hostname 127.0.0.1:9050 --max-time 5 http://example.com 2>/dev/null | grep -q "Example"; then
+              echo "✅ Tor working!"
+              break
+            fi
+            echo "  $i/60..."
+            sleep 2
+          done
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install firefox
+          echo "✅ Playwright + Firefox installed"
+
+      - name: Execute Firefox Task
+        env:
+          ACTION: ${{ github.event.inputs.action }}
+          TARGET_URL: ${{ github.event.inputs.url }}
+          WAIT_MS: ${{ github.event.inputs.wait_ms }}
+        run: |
+          node << 'NODEEOF'
+          const { firefox } = require('playwright');
+          
+          const AHMIA = 'http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion';
+          
+          async function run() {
+            const action = process.env.ACTION;
+            const targetUrl = process.env.TARGET_URL;
+            const waitMs = parseInt(process.env.WAIT_MS) || 8000;
+            
+            console.log('🦊 Launching Firefox with SOCKS5 proxy...');
+            
+            const browser = await firefox.launch({
+              headless: true,
+              firefoxUserPrefs: {
+                // Firefox SOCKS5 proxy with remote DNS (critical for .onion!)
+                'network.proxy.type': 1,
+                'network.proxy.socks': '127.0.0.1',
+                'network.proxy.socks_port': 9050,
+                'network.proxy.socks_remote_dns': true,
+                'network.proxy.socks_version': 5,
+                // Disable proxy for nothing
+                'network.proxy.no_proxies_on': '',
+                // Allow .onion domains
+                'network.dns.blockDotOnion': false,
+                // Disable safe browsing (blocks .onion)
+                'browser.safebrowsing.enabled': false,
+                'browser.safebrowsing.malware.enabled': false,
+                // Performance
+                'dom.webnotifications.enabled': false,
+                'media.autoplay.default': 5
+              }
+            });
+            
+            const context = await browser.newContext({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0',
+              viewport: { width: 1920, height: 1080 }
+            });
+            
+            const page = await context.newPage();
+            page.setDefaultTimeout(90000);
+            
+            let result = {
+              action: action,
+              success: false,
+              timestamp: new Date().toISOString()
+            };
+            
+            try {
+              if (action === 'search') {
+                console.log(`🔍 Searching Ahmia for: "${targetUrl}"`);
+                
+                await page.goto(AHMIA, { waitUntil: 'networkidle', timeout: 90000 });
+                console.log('   ✅ Ahmia loaded');
+                
+                await page.fill('input[name="q"]', targetUrl);
+                console.log('   ✅ Query entered');
+                
+                await Promise.all([
+                  page.waitForNavigation({ waitUntil: 'networkidle' }),
+                  page.click('input[type="submit"]')
+                ]);
+                console.log('   ✅ Search submitted');
+                
+                await page.waitForTimeout(waitMs);
+                console.log(`   ✅ Waited ${waitMs}ms`);
+                
+                result.searchResults = await page.evaluate(() => {
+                  const results = [];
+                  const selectors = ['li.result', '.result', 'li[class*="result"]', '.results li'];
+                  
+                  let items = [];
+                  for (const sel of selectors) {
+                    items = document.querySelectorAll(sel);
+                    if (items.length > 0) break;
+                  }
+                  
+                  items.forEach((item, i) => {
+                    if (i >= 15) return;
+                    const link = item.querySelector('a[href*=".onion"]') || item.querySelector('a');
+                    const title = item.querySelector('h4, h3, .title, a')?.textContent?.trim();
+                    const snippet = item.querySelector('p, .snippet')?.textContent?.trim();
+                    
+                    if (link?.href) {
+                      results.push({
+                        title: title?.substring(0, 100) || 'No title',
+                        url: link.href,
+                        snippet: snippet?.substring(0, 200) || ''
+                      });
+                    }
+                  });
+                  
+                  // Fallback
+                  if (results.length === 0) {
+                    document.querySelectorAll('a[href*=".onion"]').forEach((link, i) => {
+                      if (i < 15) results.push({ title: link.textContent?.trim() || 'Link', url: link.href, snippet: '' });
+                    });
+                  }
+                  
+                  return results;
+                });
+                
+                result.resultsCount = result.searchResults.length;
+                result.success = true;
+                console.log(`   ✅ Extracted ${result.resultsCount} results`);
+                
+              } else if (action === 'navigate') {
+                console.log(`🌐 Navigating to: ${targetUrl}`);
+                
+                await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 90000 });
+                await page.waitForTimeout(waitMs);
+                
+                result.url = page.url();
+                result.title = await page.title();
+                result.content = await page.content();
+                result.onionLinks = await page.evaluate(() => 
+                  [...new Set([...document.querySelectorAll('a[href*=".onion"]')].map(a => a.href))].slice(0, 20)
+                );
+                result.success = true;
+                console.log(`   ✅ Page loaded: ${result.title}`);
+              }
+              
+            } catch (error) {
+              result.error = error.message;
+              result.stack = error.stack;
+              console.error(`❌ Error: ${error.message}`);
+            }
+            
+            await browser.close();
+            
+            console.log('');
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify(result, null, 2));
+            console.log('======== RESULT END ========');
+          }
+          
+          run().catch(err => {
+            console.error('Fatal:', err);
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify({ success: false, error: err.message }));
+            console.log('======== RESULT END ========');
+          });
+          NODEEOF
