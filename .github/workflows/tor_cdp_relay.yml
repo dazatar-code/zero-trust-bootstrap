@@ -95,7 +95,9 @@ jobs:
           echo "   Timeout: ${TIMEOUT}s"
           echo ""
           
-          node << 'NODEEOF'
+          # Use torsocks to force ALL network traffic through Tor
+          # This includes DNS resolution for .onion domains!
+          torsocks node << 'NODEEOF'
           const puppeteer = require('puppeteer');
           
           const AHMIA_URL = 'http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion';
@@ -107,7 +109,7 @@ jobs:
             const waitMs = parseInt(process.env.WAIT_MS) || 5000;
             const timeoutSec = parseInt(process.env.TIMEOUT) || 60;
             
-            console.log('🚀 Launching browser with Tor proxy...');
+            console.log('🚀 Launching browser with Tor SOCKS5 proxy...');
             
             const browser = await puppeteer.launch({
               headless: 'new',
@@ -115,7 +117,14 @@ jobs:
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--proxy-server=socks5://127.0.0.1:9050'
+                // CRITICAL: Use socks5h:// for REMOTE DNS resolution (needed for .onion!)
+                '--proxy-server=socks5://127.0.0.1:9050',
+                // Force ALL DNS through the proxy (critical for .onion domains)
+                '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1',
+                // Disable features that might bypass proxy
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-sync'
               ]
             });
             
