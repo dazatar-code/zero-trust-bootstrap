@@ -1,0 +1,257 @@
+name: Tor CDP v3 - Custom Gateway
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'search or navigate'
+        required: true
+        default: 'search'
+      url:
+        description: 'URL or search query'
+        required: true
+      wait_ms:
+        description: 'Wait time in ms'
+        required: false
+        default: '8000'
+
+jobs:
+  browser-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install Tor
+        run: |
+          echo "🧅 Installing Tor..."
+          sudo apt-get update
+          sudo apt-get install -y tor
+          sudo service tor start
+          
+          echo "⏳ Waiting for Tor..."
+          for i in {1..30}; do
+            if curl -s --socks5-hostname 127.0.0.1:9050 --max-time 10 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
+              echo "✅ Tor ready!"
+              curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip
+              break
+            fi
+            echo "  $i/30..."
+            sleep 3
+          done
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: |
+          npm init -y
+          npm install puppeteer socks
+          echo "✅ Installed puppeteer + socks"
+
+      - name: Create and Run Gateway + Browser
+        env:
+          ACTION: ${{ github.event.inputs.action }}
+          TARGET_URL: ${{ github.event.inputs.url }}
+          WAIT_MS: ${{ github.event.inputs.wait_ms }}
+        run: |
+          # Create the gateway script
+          cat > gateway.js << 'GATEWAYJS'
+          const http = require('http');
+          const net = require('net');
+          const { SocksClient } = require('socks');
+          
+          const GATEWAY_PORT = 8888;
+          const TOR_HOST = '127.0.0.1';
+          const TOR_PORT = 9050;
+          
+          // Handle HTTP CONNECT (for HTTPS tunneling)
+          const server = http.createServer();
+          
+          server.on('connect', async (req, clientSocket, head) => {
+            const [host, port] = req.url.split(':');
+            console.log(`[CONNECT] ${host}:${port}`);
+            
+            try {
+              const { socket } = await SocksClient.createConnection({
+                proxy: { host: TOR_HOST, port: TOR_PORT, type: 5 },
+                command: 'connect',
+                destination: { host, port: parseInt(port) || 443 }
+              });
+              
+              clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+              socket.write(head);
+              socket.pipe(clientSocket);
+              clientSocket.pipe(socket);
+              
+              socket.on('error', (e) => console.error('[Socket error]', e.message));
+              clientSocket.on('error', (e) => console.error('[Client error]', e.message));
+            } catch (err) {
+              console.error('[CONNECT failed]', err.message);
+              clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+              clientSocket.end();
+            }
+          });
+          
+          // Handle plain HTTP requests
+          server.on('request', async (req, res) => {
+            const url = new URL(req.url);
+            console.log(`[HTTP] ${req.method} ${url.hostname}${url.pathname}`);
+            
+            try {
+              const { socket } = await SocksClient.createConnection({
+                proxy: { host: TOR_HOST, port: TOR_PORT, type: 5 },
+                command: 'connect',
+                destination: { host: url.hostname, port: parseInt(url.port) || 80 }
+              });
+              
+              // Forward the HTTP request
+              let reqLine = `${req.method} ${url.pathname}${url.search} HTTP/1.1\r\n`;
+              reqLine += `Host: ${url.hostname}\r\n`;
+              
+              for (let i = 0; i < req.rawHeaders.length; i += 2) {
+                const key = req.rawHeaders[i].toLowerCase();
+                if (key !== 'proxy-connection' && key !== 'host') {
+                  reqLine += `${req.rawHeaders[i]}: ${req.rawHeaders[i+1]}\r\n`;
+                }
+              }
+              reqLine += `Connection: close\r\n\r\n`;
+              
+              socket.write(reqLine);
+              req.pipe(socket);
+              socket.pipe(res);
+              
+              socket.on('error', (e) => {
+                console.error('[Socket error]', e.message);
+                res.writeHead(502);
+                res.end('Bad Gateway');
+              });
+            } catch (err) {
+              console.error('[HTTP failed]', err.message);
+              res.writeHead(502);
+              res.end(`Bad Gateway: ${err.message}`);
+            }
+          });
+          
+          server.listen(GATEWAY_PORT, '127.0.0.1', () => {
+            console.log(`🌉 Gateway listening on http://127.0.0.1:${GATEWAY_PORT}`);
+          });
+          GATEWAYJS
+          
+          # Start gateway in background
+          echo "🌉 Starting HTTP-to-SOCKS gateway..."
+          node gateway.js &
+          GATEWAY_PID=$!
+          sleep 2
+          
+          # Test gateway
+          echo "Testing gateway..."
+          TEST_RESULT=$(curl -s --proxy http://127.0.0.1:8888 --max-time 20 http://check.torproject.org/api/ip 2>/dev/null)
+          echo "Gateway test: $TEST_RESULT"
+          
+          # Create browser script
+          cat > browser.js << 'BROWSERJS'
+          const puppeteer = require('puppeteer');
+          const AHMIA = 'http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion';
+          
+          async function run() {
+            const action = process.env.ACTION;
+            const target = process.env.TARGET_URL;
+            const waitMs = parseInt(process.env.WAIT_MS) || 8000;
+            
+            console.log('🚀 Launching Chrome via custom gateway...');
+            
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--proxy-server=http://127.0.0.1:8888',
+                '--disable-features=SafeBrowsing,NetworkService,NetworkServiceInProcess',
+                '--disable-web-security',
+                '--ignore-certificate-errors',
+                '--disable-extensions'
+              ]
+            });
+            
+            const page = await browser.newPage();
+            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0');
+            page.setDefaultNavigationTimeout(90000);
+            
+            let result = { action, success: false, timestamp: new Date().toISOString() };
+            
+            try {
+              if (action === 'search') {
+                console.log('🔍 Searching Ahmia for: ' + target);
+                await page.goto(AHMIA, { waitUntil: 'networkidle2' });
+                console.log('   ✅ Homepage loaded');
+                
+                await page.waitForSelector('input[name="q"]', { timeout: 15000 });
+                await page.type('input[name="q"]', target);
+                console.log('   ✅ Query entered');
+                
+                await Promise.all([
+                  page.waitForNavigation({ waitUntil: 'networkidle2' }),
+                  page.click('input[type="submit"]')
+                ]);
+                console.log('   ✅ Search submitted');
+                
+                await new Promise(r => setTimeout(r, waitMs));
+                
+                result.searchResults = await page.evaluate(() => {
+                  const results = [];
+                  document.querySelectorAll('li.result, .result').forEach((item, i) => {
+                    if (i >= 15) return;
+                    const link = item.querySelector('a[href*=".onion"]') || item.querySelector('a');
+                    if (link) {
+                      results.push({
+                        title: item.querySelector('h4, h3, a')?.textContent?.trim()?.substring(0, 100) || 'No title',
+                        url: link.href,
+                        snippet: item.querySelector('p')?.textContent?.trim()?.substring(0, 200) || ''
+                      });
+                    }
+                  });
+                  if (results.length === 0) {
+                    document.querySelectorAll('a[href*=".onion"]').forEach((link, i) => {
+                      if (i >= 15) return;
+                      results.push({ title: link.textContent?.trim() || 'Link', url: link.href, snippet: '' });
+                    });
+                  }
+                  return results;
+                });
+                
+                result.resultsCount = result.searchResults.length;
+                result.success = true;
+                console.log('   ✅ Found ' + result.resultsCount + ' results');
+                
+              } else {
+                console.log('🌐 Navigating to: ' + target);
+                await page.goto(target, { waitUntil: 'networkidle2' });
+                result.url = page.url();
+                result.title = await page.title();
+                result.contentLength = (await page.content()).length;
+                result.success = true;
+              }
+            } catch (error) {
+              result.error = error.message;
+              console.error('❌ Error: ' + error.message);
+            }
+            
+            await browser.close();
+            console.log('');
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify(result, null, 2));
+            console.log('======== RESULT END ========');
+          }
+          
+          run().catch(err => {
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify({ success: false, error: err.message }));
+            console.log('======== RESULT END ========');
+          });
+          BROWSERJS
+          
+          # Run browser
+          node browser.js
+          
+          # Cleanup
+          kill $GATEWAY_PID 2>/dev/null || true
