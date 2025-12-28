@@ -1,0 +1,261 @@
+name: Tor JSDOM Relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'search'
+        type: choice
+        options:
+          - search
+          - fetch
+          - execute
+      url:
+        description: 'URL or search query'
+        required: true
+        default: 'security'
+      javascript:
+        description: 'JavaScript code to execute (for execute action)'
+        required: false
+        default: ''
+      timeout:
+        description: 'Timeout in seconds'
+        required: false
+        default: '90'
+
+jobs:
+  jsdom-relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Install Tor
+        run: |
+          echo "🧅 Installing Tor..."
+          sudo apt-get update
+          sudo apt-get install -y tor
+          echo "✅ Tor installed"
+          
+      - name: Start Tor and Wait
+        run: |
+          echo "🚀 Starting Tor..."
+          sudo service tor start
+          
+          echo "⏳ Waiting for Tor bootstrap..."
+          for i in {1..30}; do
+            if curl -s --socks5-hostname 127.0.0.1:9050 \
+                 --max-time 10 \
+                 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
+              echo "✅ Tor is ready!"
+              curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip
+              exit 0
+            fi
+            echo "  Waiting... ($i/30)"
+            sleep 2
+          done
+          echo "⚠️ Tor check timed out, continuing anyway..."
+          
+      - name: Install jsdom Dependencies
+        run: |
+          npm init -y
+          npm install jsdom axios socks-proxy-agent
+          echo "✅ jsdom + axios + socks-proxy-agent installed"
+          
+      - name: Execute JSDOM Task
+        env:
+          ACTION: ${{ github.event.inputs.action }}
+          TARGET_URL: ${{ github.event.inputs.url }}
+          JAVASCRIPT: ${{ github.event.inputs.javascript }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+        run: |
+          echo "🌐 JSDOM Task"
+          echo "   Action: $ACTION"
+          echo "   URL/Query: $TARGET_URL"
+          echo "   Timeout: ${TIMEOUT}s"
+          echo ""
+          
+          node << 'NODEEOF'
+          const { JSDOM } = require('jsdom');
+          const axios = require('axios');
+          const { SocksProxyAgent } = require('socks-proxy-agent');
+          
+          // SOCKS5h proxy for Tor (h = proxy-side DNS resolution!)
+          const proxyAgent = new SocksProxyAgent('socks5h://127.0.0.1:9050');
+          
+          const AHMIA_URL = 'http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion';
+          
+          async function fetchTor(url, timeout = 60000) {
+            console.log(`📡 Fetching: ${url}`);
+            const response = await axios.get(url, {
+              httpAgent: proxyAgent,
+              httpsAgent: proxyAgent,
+              timeout: timeout,
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0'
+              },
+              validateStatus: () => true,
+              maxRedirects: 5
+            });
+            console.log(`   Status: ${response.status}`);
+            return response.data;
+          }
+          
+          async function run() {
+            const action = process.env.ACTION;
+            const targetUrl = process.env.TARGET_URL;
+            const javascript = process.env.JAVASCRIPT || '';
+            const timeoutSec = parseInt(process.env.TIMEOUT) || 90;
+            const timeoutMs = timeoutSec * 1000;
+            
+            const result = {
+              action: action,
+              success: false,
+              timestamp: new Date().toISOString()
+            };
+            
+            try {
+              switch (action) {
+                case 'search': {
+                  // Step 1: Load Ahmia homepage
+                  console.log('🔍 Loading Ahmia search engine...');
+                  const homeHtml = await fetchTor(AHMIA_URL, timeoutMs);
+                  const homeDom = new JSDOM(homeHtml, { url: AHMIA_URL });
+                  
+                  // Step 2: Find search form
+                  const doc = homeDom.window.document;
+                  const searchInput = doc.querySelector('input[name="q"], input[type="search"]');
+                  const form = searchInput?.closest('form');
+                  
+                  if (!form || !searchInput) {
+                    throw new Error('Could not find search form on Ahmia');
+                  }
+                  
+                  // Step 3: Build search URL
+                  const formAction = form.action || AHMIA_URL;
+                  const baseUrl = formAction.startsWith('http') ? formAction : AHMIA_URL + formAction;
+                  const searchUrl = `${baseUrl}?q=${encodeURIComponent(targetUrl)}`;
+                  console.log(`🔎 Search URL: ${searchUrl}`);
+                  
+                  // Step 4: Fetch search results
+                  const resultsHtml = await fetchTor(searchUrl, timeoutMs);
+                  const resultsDom = new JSDOM(resultsHtml, { 
+                    url: searchUrl,
+                    runScripts: 'dangerously'
+                  });
+                  const resultsDoc = resultsDom.window.document;
+                  
+                  // Step 5: Extract results
+                  const selectors = [
+                    '.result', '.search-result', '.search_result', 
+                    'li.result', '.results li', 'article'
+                  ];
+                  
+                  let resultElements = [];
+                  for (const sel of selectors) {
+                    resultElements = resultsDoc.querySelectorAll(sel);
+                    if (resultElements.length > 0) {
+                      console.log(`   Found ${resultElements.length} results with selector: ${sel}`);
+                      break;
+                    }
+                  }
+                  
+                  const searchResults = [];
+                  resultElements.forEach((el, i) => {
+                    const title = el.querySelector('h3, h4, h2, .title, a')?.textContent?.trim();
+                    const link = el.querySelector('a')?.href;
+                    const snippet = el.querySelector('.snippet, p, .description, cite')?.textContent?.trim();
+                    
+                    if (title && title.length > 0) {
+                      searchResults.push({ title, url: link, snippet });
+                    }
+                  });
+                  
+                  // Fallback: get all .onion links
+                  if (searchResults.length === 0) {
+                    const allLinks = resultsDoc.querySelectorAll('a[href*=".onion"]');
+                    allLinks.forEach(a => {
+                      searchResults.push({
+                        title: a.textContent?.trim() || 'Onion Link',
+                        url: a.href,
+                        snippet: ''
+                      });
+                    });
+                    console.log(`   Fallback: found ${searchResults.length} .onion links`);
+                  }
+                  
+                  result.success = true;
+                  result.query = targetUrl;
+                  result.searchUrl = searchUrl;
+                  result.resultsCount = searchResults.length;
+                  result.searchResults = searchResults.slice(0, 20);
+                  result.pageTitle = resultsDoc.title;
+                  break;
+                }
+                
+                case 'fetch': {
+                  const html = await fetchTor(targetUrl, timeoutMs);
+                  const dom = new JSDOM(html, { url: targetUrl });
+                  const doc = dom.window.document;
+                  
+                  result.success = true;
+                  result.url = targetUrl;
+                  result.title = doc.title;
+                  result.htmlLength = html.length;
+                  result.textPreview = doc.body?.textContent?.substring(0, 500);
+                  result.linksCount = doc.querySelectorAll('a').length;
+                  result.onionLinks = Array.from(doc.querySelectorAll('a[href*=".onion"]'))
+                    .map(a => a.href)
+                    .slice(0, 10);
+                  break;
+                }
+                
+                case 'execute': {
+                  if (!javascript) {
+                    throw new Error('JavaScript code is required for execute action');
+                  }
+                  
+                  const html = await fetchTor(targetUrl, timeoutMs);
+                  const dom = new JSDOM(html, { 
+                    url: targetUrl,
+                    runScripts: 'dangerously'
+                  });
+                  
+                  // Execute custom JavaScript
+                  const evalResult = dom.window.eval(javascript);
+                  
+                  result.success = true;
+                  result.url = targetUrl;
+                  result.title = dom.window.document.title;
+                  result.evalResult = evalResult;
+                  break;
+                }
+                
+                default:
+                  throw new Error(`Unknown action: ${action}`);
+              }
+              
+            } catch (error) {
+              result.error = error.message;
+              result.stack = error.stack;
+              console.error(`❌ Error: ${error.message}`);
+            }
+            
+            // Output result
+            console.log('');
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify(result, null, 2));
+            console.log('======== RESULT END ========');
+            
+            process.exit(result.success ? 0 : 1);
+          }
+          
+          run().catch(err => {
+            console.error('Fatal error:', err);
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify({ success: false, error: err.message }));
+            console.log('======== RESULT END ========');
+            process.exit(1);
+          });
+          NODEEOF
