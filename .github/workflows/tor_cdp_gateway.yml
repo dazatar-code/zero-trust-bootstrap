@@ -1,0 +1,265 @@
+name: Tor CDP Relay - Protocol Gateway
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action: search, navigate, scrape'
+        required: true
+        default: 'search'
+      url:
+        description: 'URL or search query'
+        required: true
+      selector:
+        description: 'CSS selector (optional)'
+        required: false
+        default: ''
+      wait_ms:
+        description: 'Wait time in ms'
+        required: false
+        default: '5000'
+      timeout:
+        description: 'Timeout in seconds'
+        required: false
+        default: '90'
+
+jobs:
+  browser-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install Tor and Privoxy
+        run: |
+          echo "🧅 Installing Tor + Privoxy (HTTP-to-SOCKS gateway)..."
+          sudo apt-get update
+          sudo apt-get install -y tor privoxy
+          
+          # Configure Privoxy to forward to Tor SOCKS
+          echo "forward-socks5t / 127.0.0.1:9050 ." | sudo tee -a /etc/privoxy/config
+          echo "listen-address 127.0.0.1:8118" | sudo tee -a /etc/privoxy/config
+          
+          # Start services
+          sudo service tor start
+          sudo service privoxy start
+          
+          echo "⏳ Waiting for Tor bootstrap..."
+          for i in {1..45}; do
+            if curl -s --socks5-hostname 127.0.0.1:9050 --max-time 10 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
+              echo "✅ Tor is ready!"
+              curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip
+              break
+            fi
+            echo "  Attempt $i/45..."
+            sleep 2
+          done
+          
+          # Verify Privoxy is forwarding through Tor
+          echo ""
+          echo "🔍 Testing Privoxy gateway..."
+          if curl -s --proxy http://127.0.0.1:8118 --max-time 15 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
+            echo "✅ Privoxy gateway working!"
+          else
+            echo "⚠️ Privoxy check failed, continuing anyway..."
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
+        run: |
+          npm init -y
+          npm install puppeteer
+          echo "✅ Puppeteer installed with bundled Chromium"
+
+      - name: Execute Browser Task
+        env:
+          ACTION: ${{ github.event.inputs.action }}
+          TARGET_URL: ${{ github.event.inputs.url }}
+          SELECTOR: ${{ github.event.inputs.selector }}
+          WAIT_MS: ${{ github.event.inputs.wait_ms }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+        run: |
+          echo "🌐 Browser Task"
+          echo "   Action: $ACTION"
+          echo "   URL/Query: $TARGET_URL"
+          echo ""
+          
+          node << 'NODEEOF'
+          const puppeteer = require('puppeteer');
+          
+          const AHMIA_URL = 'http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion';
+          
+          async function run() {
+            const action = process.env.ACTION;
+            const targetUrl = process.env.TARGET_URL;
+            const selector = process.env.SELECTOR || '';
+            const waitMs = parseInt(process.env.WAIT_MS) || 5000;
+            const timeoutMs = parseInt(process.env.TIMEOUT) * 1000 || 90000;
+            
+            console.log('🚀 Launching browser with Privoxy HTTP gateway...');
+            console.log('   Privoxy (HTTP) -> Tor (SOCKS5) -> .onion');
+            console.log('');
+            
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                // Use Privoxy HTTP proxy (which forwards to Tor SOCKS5)
+                '--proxy-server=http://127.0.0.1:8118',
+                // Disable features that might bypass proxy
+                '--disable-extensions',
+                '--disable-background-networking'
+              ]
+            });
+            
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1920, height: 1080 });
+            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0');
+            page.setDefaultNavigationTimeout(timeoutMs);
+            
+            let result = {
+              action: action,
+              success: false,
+              timestamp: new Date().toISOString()
+            };
+            
+            try {
+              if (action === 'search') {
+                // SEARCH: Go to Ahmia, search, extract results
+                console.log(`🔍 Searching Ahmia for: "${targetUrl}"`);
+                
+                await page.goto(AHMIA_URL, { waitUntil: 'networkidle2', timeout: timeoutMs });
+                console.log('   ✅ Ahmia homepage loaded');
+                
+                await page.waitForSelector('input[name="q"]', { timeout: 15000 });
+                await page.type('input[name="q"]', targetUrl);
+                console.log('   ✅ Query entered');
+                
+                await Promise.all([
+                  page.waitForNavigation({ waitUntil: 'networkidle2', timeout: timeoutMs }),
+                  page.click('input[type="submit"]')
+                ]);
+                console.log('   ✅ Search submitted');
+                
+                // Wait for JavaScript to render results
+                await new Promise(r => setTimeout(r, waitMs));
+                console.log(`   ✅ Waited ${waitMs}ms for JS rendering`);
+                
+                // Extract search results
+                result.searchResults = await page.evaluate(() => {
+                  const results = [];
+                  
+                  // Try multiple selectors for results
+                  const selectors = [
+                    'li.result',
+                    '.result',
+                    '.search-result',
+                    'li[class*="result"]',
+                    '.results li',
+                    '#results li'
+                  ];
+                  
+                  let items = [];
+                  for (const sel of selectors) {
+                    items = document.querySelectorAll(sel);
+                    if (items.length > 0) break;
+                  }
+                  
+                  items.forEach((item, i) => {
+                    if (i >= 15) return; // Limit to 15 results
+                    
+                    const link = item.querySelector('a[href*=".onion"]') || item.querySelector('a');
+                    const title = item.querySelector('h4, h3, .title, a')?.textContent?.trim();
+                    const snippet = item.querySelector('p, .snippet, .description')?.textContent?.trim();
+                    
+                    if (link && link.href) {
+                      results.push({
+                        title: title?.substring(0, 100) || 'No title',
+                        url: link.href,
+                        snippet: snippet?.substring(0, 200) || ''
+                      });
+                    }
+                  });
+                  
+                  // Fallback: get all .onion links if no structured results
+                  if (results.length === 0) {
+                    const allLinks = document.querySelectorAll('a[href*=".onion"]');
+                    allLinks.forEach((link, i) => {
+                      if (i >= 15) return;
+                      results.push({
+                        title: link.textContent?.trim()?.substring(0, 100) || 'Link',
+                        url: link.href,
+                        snippet: ''
+                      });
+                    });
+                  }
+                  
+                  return results;
+                });
+                
+                result.resultsCount = result.searchResults.length;
+                result.success = true;
+                console.log(`   ✅ Extracted ${result.resultsCount} results`);
+                
+              } else if (action === 'navigate' || action === 'scrape') {
+                // NAVIGATE/SCRAPE: Go to URL, get content
+                console.log(`🌐 Navigating to: ${targetUrl}`);
+                
+                await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: timeoutMs });
+                await new Promise(r => setTimeout(r, waitMs));
+                
+                result.url = page.url();
+                result.title = await page.title();
+                
+                if (selector) {
+                  try {
+                    result.content = await page.$eval(selector, el => el.innerHTML);
+                  } catch (e) {
+                    result.selectorError = `Selector "${selector}" not found`;
+                    result.content = await page.content();
+                  }
+                } else {
+                  result.content = await page.content();
+                }
+                
+                // Extract all .onion links
+                result.onionLinks = await page.evaluate(() => {
+                  return Array.from(document.querySelectorAll('a[href*=".onion"]'))
+                    .map(a => a.href)
+                    .filter((v, i, a) => a.indexOf(v) === i)
+                    .slice(0, 20);
+                });
+                
+                result.success = true;
+                console.log(`   ✅ Page loaded: ${result.title}`);
+                
+              } else {
+                result.error = `Unknown action: ${action}`;
+              }
+              
+            } catch (error) {
+              result.error = error.message;
+              result.stack = error.stack;
+              console.error(`❌ Error: ${error.message}`);
+            }
+            
+            await browser.close();
+            
+            // Output result
+            console.log('');
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify(result, null, 2));
+            console.log('======== RESULT END ========');
+          }
+          
+          run().catch(err => {
+            console.error('Fatal error:', err);
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify({ success: false, error: err.message }));
+            console.log('======== RESULT END ========');
+            process.exit(1);
+          });
+          NODEEOF
