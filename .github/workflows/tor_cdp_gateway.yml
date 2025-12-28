@@ -138,7 +138,15 @@ jobs:
                 '--disable-background-networking',
                 '--disable-sync',
                 '--disable-default-apps',
-                '--no-first-run'
+                '--no-first-run',
+                // Enable .onion URL access
+                '--disable-features=BlockInsecurePrivateNetworkRequests',
+                '--allow-running-insecure-content',
+                '--disable-web-security',
+                '--ignore-certificate-errors',
+                // Force proxy for all URLs including .onion
+                '--proxy-bypass-list=<-loopback>',
+                '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1'
               ]
             });
             
