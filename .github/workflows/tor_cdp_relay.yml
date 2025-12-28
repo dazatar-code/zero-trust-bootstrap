@@ -95,9 +95,9 @@ jobs:
           echo "   Timeout: ${TIMEOUT}s"
           echo ""
           
-          # Use torsocks to force ALL network traffic through Tor
-          # This includes DNS resolution for .onion domains!
-          torsocks node << 'NODEEOF'
+          # Note: We use Chrome's native proxy support, NOT torsocks
+          # torsocks breaks Puppeteer's WebSocket communication
+          node << 'NODEEOF'
           const puppeteer = require('puppeteer');
           
           const AHMIA_URL = 'http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion';
