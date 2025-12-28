@@ -39,33 +39,64 @@ jobs:
     timeout-minutes: 10
     
     steps:
-      - name: Install Tor
+      - name: Install and Start Tor
         run: |
+          # Install Tor
           sudo apt-get update
           sudo apt-get install -y tor
-          sudo service tor start
           
-          echo "⏳ Waiting for Tor to bootstrap..."
-          for i in {1..30}; do
-            if curl --socks5-hostname 127.0.0.1:9050 -s --max-time 10 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
+          # Create proper Tor config
+          echo "SOCKSPort 9050" | sudo tee /etc/tor/torrc
+          echo "DataDirectory /var/lib/tor" | sudo tee -a /etc/tor/torrc
+          echo "Log notice stdout" | sudo tee -a /etc/tor/torrc
+          
+          # Ensure directories exist with correct permissions
+          sudo mkdir -p /var/lib/tor /var/log/tor
+          sudo chown -R debian-tor:debian-tor /var/lib/tor /var/log/tor
+          sudo chmod 700 /var/lib/tor
+          
+          # Start Tor directly (not via service)
+          echo "🚀 Starting Tor..."
+          sudo -u debian-tor tor &
+          TOR_PID=$!
+          
+          echo "⏳ Waiting for Tor to bootstrap (PID: $TOR_PID)..."
+          for i in {1..60}; do
+            if curl --socks5-hostname 127.0.0.1:9050 -s --max-time 5 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
               echo "✅ Tor is ready!"
               curl --socks5-hostname 127.0.0.1:9050 -s http://check.torproject.org/api/ip
-              break
+              exit 0
             fi
-            echo "  Attempt $i/30..."
+            echo "  Attempt $i/60..."
             sleep 2
           done
+          
+          echo "❌ Tor failed to bootstrap"
+          exit 1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install Puppeteer
+      - name: Install Puppeteer (Full Package)
         run: |
           npm init -y
-          npm install puppeteer
-          echo "✅ Puppeteer installed"
+          npm install puppeteer@latest
+          echo "✅ Puppeteer installed with bundled Chromium"
+          
+      - name: Verify Tor Still Running
+        run: |
+          echo "🔍 Verifying Tor is still running..."
+          if curl --socks5-hostname 127.0.0.1:9050 -s --max-time 10 http://check.torproject.org/api/ip | grep -q "IsTor"; then
+            echo "✅ Tor confirmed working"
+            curl --socks5-hostname 127.0.0.1:9050 -s http://check.torproject.org/api/ip
+          else
+            echo "❌ Tor not responding, restarting..."
+            sudo pkill -9 tor || true
+            sudo -u debian-tor tor &
+            sleep 30
+          fi
 
       - name: Execute Browser Task
         env:
