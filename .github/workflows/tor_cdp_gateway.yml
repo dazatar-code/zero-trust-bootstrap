@@ -31,88 +31,61 @@ jobs:
         run: |
           echo "🧅 Installing Tor + Privoxy..."
           sudo apt-get update
-          sudo apt-get install -y tor privoxy
+          sudo apt-get install -y tor privoxy netcat-openbsd
           
-          # STOP Privoxy (auto-starts on install)
+          # STOP Privoxy (auto-starts on install with default config)
           sudo service privoxy stop || true
           
           # Start Tor FIRST
           sudo service tor start
           
-          echo "⏳ Waiting for Tor bootstrap (up to 3 minutes)..."
-          for i in {1..90}; do
-            if curl -s --socks5-hostname 127.0.0.1:9050 --max-time 5 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
-              echo "✅ Tor is ready!"
-              curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip
+          echo "⏳ Waiting for Tor SOCKS to be ready..."
+          for i in $(seq 1 60); do
+            if nc -z 127.0.0.1 9050 2>/dev/null; then
+              echo "✅ Tor SOCKS port 9050 is open (attempt $i)"
               break
             fi
-            # Also try fetching a simpler site
-            if curl -s --socks5-hostname 127.0.0.1:9050 --max-time 3 http://example.com 2>/dev/null | grep -q "Example"; then
-              echo "✅ Tor is working (example.com)"
-              break
-            fi
-            echo "  Waiting... ($i/90)"
+            echo "  Waiting for Tor... ($i/60)"
             sleep 2
           done
           
-          # Configure Privoxy - COMPLETE config file
-          echo "🔧 Configuring Privoxy..."
-          sudo bash -c 'cat > /etc/privoxy/config << EOF
-confdir /etc/privoxy
-logdir /var/log/privoxy
-actionsfile match-all.action
-actionsfile default.action
-filterfile default.filter
-logfile logfile
-listen-address 127.0.0.1:8118
-toggle 1
-enable-remote-toggle 0
-enable-remote-http-toggle 0
-enable-edit-actions 0
-buffer-limit 4096
-forward-socks5t / 127.0.0.1:9050 .
-EOF'
+          # Give Tor time to build circuits
+          echo "⏳ Waiting 20s for Tor to establish circuits..."
+          sleep 20
           
+          # Configure Privoxy - use tee with multiple lines (no heredoc)
+          echo "🔧 Configuring Privoxy..."
+          echo "confdir /etc/privoxy" | sudo tee /etc/privoxy/config > /dev/null
+          echo "logdir /var/log/privoxy" | sudo tee -a /etc/privoxy/config > /dev/null
+          echo "listen-address 127.0.0.1:8118" | sudo tee -a /etc/privoxy/config > /dev/null
+          echo "toggle 1" | sudo tee -a /etc/privoxy/config > /dev/null
+          echo "forward-socks5t / 127.0.0.1:9050 ." | sudo tee -a /etc/privoxy/config > /dev/null
+          
+          echo "📋 Privoxy config:"
+          cat /etc/privoxy/config
+          
+          # Start Privoxy
+          echo ""
           echo "🔧 Starting Privoxy..."
           sudo service privoxy start
           sleep 3
           
-          # Verify Privoxy running
-          if pgrep privoxy > /dev/null; then
-            echo "✅ Privoxy process running (PID: $(pgrep privoxy))"
+          # Verify both services
+          echo ""
+          echo "📊 Service Status:"
+          if nc -z 127.0.0.1 9050; then echo "  ✅ Tor SOCKS (9050) - OK"; else echo "  ❌ Tor SOCKS (9050) - FAIL"; fi
+          if nc -z 127.0.0.1 8118; then echo "  ✅ Privoxy HTTP (8118) - OK"; else echo "  ❌ Privoxy HTTP (8118) - FAIL"; fi
+          
+          # Test chain
+          echo ""
+          echo "🔍 Testing Privoxy -> Tor -> Internet..."
+          TEST_RESULT=$(curl -s --proxy http://127.0.0.1:8118 --max-time 30 http://example.com 2>&1 || echo "CURL_FAILED")
+          if echo "$TEST_RESULT" | grep -q "Example Domain"; then
+            echo "✅ Gateway chain working!"
           else
-            echo "❌ Privoxy failed to start!"
-            cat /var/log/privoxy/logfile 2>/dev/null | tail -20
-            exit 1
+            echo "⚠️ Gateway test result:"
+            echo "$TEST_RESULT" | head -5
           fi
-          
-          # Test Privoxy gateway - try multiple times
-          echo ""
-          echo "🔍 Testing Privoxy gateway..."
-          GATEWAY_OK=false
-          for i in {1..15}; do
-            RESULT=$(curl -s --proxy http://127.0.0.1:8118 --max-time 15 http://example.com 2>&1)
-            if echo "$RESULT" | grep -q "Example Domain"; then
-              echo "✅ Privoxy gateway working! (via example.com)"
-              GATEWAY_OK=true
-              break
-            fi
-            echo "  Attempt $i/15..."
-            sleep 2
-          done
-          
-          if [ "$GATEWAY_OK" = false ]; then
-            echo "⚠️ Gateway test via example.com failed, trying check.torproject.org..."
-            RESULT=$(curl -s --proxy http://127.0.0.1:8118 --max-time 30 http://check.torproject.org/api/ip 2>&1)
-            echo "Result: $RESULT"
-          fi
-          
-          echo ""
-          echo "📊 Status:"
-          echo "  Tor: $(pgrep tor > /dev/null && echo 'running' || echo 'NOT RUNNING')"
-          echo "  Privoxy: $(pgrep privoxy > /dev/null && echo 'running' || echo 'NOT RUNNING')"
-          echo "  Port 9050: $(netstat -tlnp 2>/dev/null | grep 9050 || echo 'not listening')"
-          echo "  Port 8118: $(netstat -tlnp 2>/dev/null | grep 8118 || echo 'not listening')"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -123,7 +96,7 @@ EOF'
         run: |
           npm init -y
           npm install puppeteer
-          echo "✅ Puppeteer installed with bundled Chromium"
+          echo "✅ Puppeteer installed"
 
       - name: Execute Browser Task
         env:
@@ -150,8 +123,8 @@ EOF'
             const waitMs = parseInt(process.env.WAIT_MS) || 5000;
             const timeoutMs = parseInt(process.env.TIMEOUT) * 1000 || 90000;
             
-            console.log('🚀 Launching browser with Privoxy HTTP gateway...');
-            console.log('   Privoxy (HTTP) -> Tor (SOCKS5) -> .onion');
+            console.log('🚀 Launching browser...');
+            console.log('   Chain: Chrome -> Privoxy (8118) -> Tor (9050) -> .onion');
             console.log('');
             
             const browser = await puppeteer.launch({
@@ -160,11 +133,12 @@ EOF'
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                // Use Privoxy HTTP proxy (which forwards to Tor SOCKS5)
                 '--proxy-server=http://127.0.0.1:8118',
-                // Disable features that might bypass proxy
                 '--disable-extensions',
-                '--disable-background-networking'
+                '--disable-background-networking',
+                '--disable-sync',
+                '--disable-default-apps',
+                '--no-first-run'
               ]
             });
             
@@ -181,7 +155,6 @@ EOF'
             
             try {
               if (action === 'search') {
-                // SEARCH: Go to Ahmia, search, extract results
                 console.log(`🔍 Searching Ahmia for: "${targetUrl}"`);
                 
                 await page.goto(AHMIA_URL, { waitUntil: 'networkidle2', timeout: timeoutMs });
@@ -197,23 +170,12 @@ EOF'
                 ]);
                 console.log('   ✅ Search submitted');
                 
-                // Wait for JavaScript to render results
                 await new Promise(r => setTimeout(r, waitMs));
-                console.log(`   ✅ Waited ${waitMs}ms for JS rendering`);
+                console.log(`   ✅ Waited ${waitMs}ms for JS`);
                 
-                // Extract search results
                 result.searchResults = await page.evaluate(() => {
                   const results = [];
-                  
-                  // Try multiple selectors for results
-                  const selectors = [
-                    'li.result',
-                    '.result',
-                    '.search-result',
-                    'li[class*="result"]',
-                    '.results li',
-                    '#results li'
-                  ];
+                  const selectors = ['li.result', '.result', '.search-result', 'li[class*="result"]'];
                   
                   let items = [];
                   for (const sel of selectors) {
@@ -222,28 +184,25 @@ EOF'
                   }
                   
                   items.forEach((item, i) => {
-                    if (i >= 15) return; // Limit to 15 results
-                    
+                    if (i >= 15) return;
                     const link = item.querySelector('a[href*=".onion"]') || item.querySelector('a');
-                    const title = item.querySelector('h4, h3, .title, a')?.textContent?.trim();
-                    const snippet = item.querySelector('p, .snippet, .description')?.textContent?.trim();
+                    const title = item.querySelector('h4, h3, .title, a');
+                    const snippet = item.querySelector('p, .snippet, .description');
                     
                     if (link && link.href) {
                       results.push({
-                        title: title?.substring(0, 100) || 'No title',
+                        title: title ? title.textContent.trim().substring(0, 100) : 'No title',
                         url: link.href,
-                        snippet: snippet?.substring(0, 200) || ''
+                        snippet: snippet ? snippet.textContent.trim().substring(0, 200) : ''
                       });
                     }
                   });
                   
-                  // Fallback: get all .onion links if no structured results
                   if (results.length === 0) {
-                    const allLinks = document.querySelectorAll('a[href*=".onion"]');
-                    allLinks.forEach((link, i) => {
+                    document.querySelectorAll('a[href*=".onion"]').forEach((link, i) => {
                       if (i >= 15) return;
                       results.push({
-                        title: link.textContent?.trim()?.substring(0, 100) || 'Link',
+                        title: link.textContent.trim().substring(0, 100) || 'Link',
                         url: link.href,
                         snippet: ''
                       });
@@ -258,7 +217,6 @@ EOF'
                 console.log(`   ✅ Extracted ${result.resultsCount} results`);
                 
               } else if (action === 'navigate' || action === 'scrape') {
-                // NAVIGATE/SCRAPE: Go to URL, get content
                 console.log(`🌐 Navigating to: ${targetUrl}`);
                 
                 await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: timeoutMs });
@@ -271,14 +229,12 @@ EOF'
                   try {
                     result.content = await page.$eval(selector, el => el.innerHTML);
                   } catch (e) {
-                    result.selectorError = `Selector "${selector}" not found`;
                     result.content = await page.content();
                   }
                 } else {
                   result.content = await page.content();
                 }
                 
-                // Extract all .onion links
                 result.onionLinks = await page.evaluate(() => {
                   return Array.from(document.querySelectorAll('a[href*=".onion"]'))
                     .map(a => a.href)
@@ -288,9 +244,6 @@ EOF'
                 
                 result.success = true;
                 console.log(`   ✅ Page loaded: ${result.title}`);
-                
-              } else {
-                result.error = `Unknown action: ${action}`;
               }
               
             } catch (error) {
@@ -301,7 +254,6 @@ EOF'
             
             await browser.close();
             
-            // Output result
             console.log('');
             console.log('======== RESULT START ========');
             console.log(JSON.stringify(result, null, 2));
@@ -309,7 +261,7 @@ EOF'
           }
           
           run().catch(err => {
-            console.error('Fatal error:', err);
+            console.error('Fatal:', err);
             console.log('======== RESULT START ========');
             console.log(JSON.stringify({ success: false, error: err.message }));
             console.log('======== RESULT END ========');
