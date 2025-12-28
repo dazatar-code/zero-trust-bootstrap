@@ -1,0 +1,253 @@
+name: Tor CDP - Fixed Gateway
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action: search, navigate'
+        required: true
+        default: 'search'
+      url:
+        description: 'URL or search query'
+        required: true
+      wait_ms:
+        description: 'Wait time in ms'
+        required: false
+        default: '5000'
+
+jobs:
+  browser-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install Tor and Privoxy
+        run: |
+          echo "🧅 Installing Tor + Privoxy..."
+          sudo apt-get update
+          sudo apt-get install -y tor privoxy
+          
+          # CORRECT Privoxy config for Tor
+          # Must use forward-socks5t with trailing dot
+          sudo tee /etc/privoxy/config << 'PRIVOXY_CONFIG'
+          listen-address  127.0.0.1:8118
+          forward-socks5t / 127.0.0.1:9050 .
+          PRIVOXY_CONFIG
+          
+          # Start services
+          sudo service tor start
+          sleep 5
+          sudo service privoxy restart
+          sleep 2
+          
+          echo "⏳ Testing Tor SOCKS directly..."
+          for i in {1..30}; do
+            if curl -s --socks5-hostname 127.0.0.1:9050 --max-time 10 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
+              echo "✅ Tor SOCKS working!"
+              break
+            fi
+            echo "  Attempt $i/30..."
+            sleep 3
+          done
+          
+          echo ""
+          echo "🔍 Testing Privoxy HTTP gateway..."
+          PRIVOXY_TEST=$(curl -s --proxy http://127.0.0.1:8118 --max-time 15 http://check.torproject.org/api/ip 2>/dev/null)
+          echo "Privoxy response: $PRIVOXY_TEST"
+          
+          if echo "$PRIVOXY_TEST" | grep -q "IsTor"; then
+            echo "✅ Privoxy gateway working!"
+          else
+            echo "❌ Privoxy failed, checking logs..."
+            sudo tail -20 /var/log/privoxy/logfile 2>/dev/null || echo "No privoxy logs"
+            
+            # Try fixing
+            echo "Trying alternate config..."
+            sudo systemctl stop privoxy
+            sudo tee /etc/privoxy/config << 'ALT_CONFIG'
+listen-address 127.0.0.1:8118
+forward-socks5 / 127.0.0.1:9050 .
+ALT_CONFIG
+            sudo systemctl start privoxy
+            sleep 2
+            
+            RETRY=$(curl -s --proxy http://127.0.0.1:8118 --max-time 15 http://check.torproject.org/api/ip 2>/dev/null)
+            echo "Retry response: $RETRY"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
+        run: |
+          npm init -y
+          npm install puppeteer
+          echo "✅ Puppeteer installed"
+
+      - name: Execute Browser Task
+        env:
+          ACTION: ${{ github.event.inputs.action }}
+          TARGET_URL: ${{ github.event.inputs.url }}
+          WAIT_MS: ${{ github.event.inputs.wait_ms }}
+        run: |
+          echo "🌐 Browser Task: $ACTION"
+          echo "   Target: $TARGET_URL"
+          echo ""
+          
+          node << 'NODEEOF'
+          const puppeteer = require('puppeteer');
+          
+          const AHMIA = 'http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion';
+          
+          async function run() {
+            const action = process.env.ACTION;
+            const target = process.env.TARGET_URL;
+            const waitMs = parseInt(process.env.WAIT_MS) || 5000;
+            
+            console.log('🚀 Launching Chrome with Privoxy gateway + .onion flags...');
+            
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                
+                // Use Privoxy HTTP proxy
+                '--proxy-server=http://127.0.0.1:8118',
+                
+                // CRITICAL: Flags to allow .onion domains
+                '--disable-features=SafeBrowsing',
+                '--disable-web-security',
+                '--allow-running-insecure-content',
+                '--ignore-certificate-errors',
+                '--unsafely-treat-insecure-origin-as-secure=http://*.onion',
+                
+                // Disable features that might interfere
+                '--disable-background-networking',
+                '--disable-client-side-phishing-detection',
+                '--disable-default-apps',
+                '--disable-extensions',
+                '--disable-hang-monitor',
+                '--disable-popup-blocking',
+                '--disable-prompt-on-repost',
+                '--disable-sync',
+                '--disable-translate',
+                '--metrics-recording-only',
+                '--no-first-run',
+                '--safebrowsing-disable-auto-update'
+              ]
+            });
+            
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1920, height: 1080 });
+            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0');
+            
+            // Set long timeout for Tor
+            page.setDefaultNavigationTimeout(90000);
+            
+            let result = { action, success: false, timestamp: new Date().toISOString() };
+            
+            try {
+              if (action === 'search') {
+                console.log(`🔍 Searching Ahmia for: "${target}"`);
+                
+                // First test: can we reach Ahmia homepage?
+                console.log('   Step 1: Loading Ahmia homepage...');
+                await page.goto(AHMIA, { waitUntil: 'networkidle2' });
+                console.log('   ✅ Homepage loaded!');
+                
+                // Find and fill search
+                console.log('   Step 2: Entering search query...');
+                await page.waitForSelector('input[name="q"]', { timeout: 15000 });
+                await page.type('input[name="q"]', target);
+                
+                // Submit search
+                console.log('   Step 3: Submitting search...');
+                await Promise.all([
+                  page.waitForNavigation({ waitUntil: 'networkidle2' }),
+                  page.click('input[type="submit"]')
+                ]);
+                
+                // Wait for JS rendering
+                console.log(`   Step 4: Waiting ${waitMs}ms for JS...`);
+                await new Promise(r => setTimeout(r, waitMs));
+                
+                // Extract results
+                console.log('   Step 5: Extracting results...');
+                result.searchResults = await page.evaluate(() => {
+                  const results = [];
+                  
+                  // Ahmia result selectors
+                  const items = document.querySelectorAll('li.result, .result, .search-result');
+                  
+                  items.forEach((item, i) => {
+                    if (i >= 15) return;
+                    const link = item.querySelector('a[href*=".onion"]') || item.querySelector('a');
+                    const title = item.querySelector('h4, h3, .title, a')?.textContent?.trim();
+                    const snippet = item.querySelector('p, .snippet')?.textContent?.trim();
+                    
+                    if (link?.href) {
+                      results.push({
+                        title: title?.substring(0, 100) || 'No title',
+                        url: link.href,
+                        snippet: snippet?.substring(0, 200) || ''
+                      });
+                    }
+                  });
+                  
+                  // Fallback: all .onion links
+                  if (results.length === 0) {
+                    document.querySelectorAll('a[href*=".onion"]').forEach((link, i) => {
+                      if (i >= 15) return;
+                      results.push({ title: link.textContent?.trim() || 'Link', url: link.href, snippet: '' });
+                    });
+                  }
+                  
+                  return results;
+                });
+                
+                result.resultsCount = result.searchResults.length;
+                result.success = true;
+                console.log(`   ✅ Found ${result.resultsCount} results`);
+                
+              } else if (action === 'navigate') {
+                console.log(`🌐 Navigating to: ${target}`);
+                await page.goto(target, { waitUntil: 'networkidle2' });
+                await new Promise(r => setTimeout(r, waitMs));
+                
+                result.url = page.url();
+                result.title = await page.title();
+                result.content = await page.content();
+                result.contentLength = result.content.length;
+                result.success = true;
+                console.log(`   ✅ Loaded: ${result.title}`);
+              }
+              
+            } catch (error) {
+              result.error = error.message;
+              console.error(`❌ Error: ${error.message}`);
+              
+              // Get page info for debugging
+              try {
+                result.currentUrl = page.url();
+                result.pageContent = await page.content();
+              } catch (e) {}
+            }
+            
+            await browser.close();
+            
+            console.log('');
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify(result, null, 2));
+            console.log('======== RESULT END ========');
+          }
+          
+          run().catch(err => {
+            console.error('Fatal:', err);
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify({ success: false, error: err.message }));
+            console.log('======== RESULT END ========');
+            process.exit(1);
+          });
+          NODEEOF
