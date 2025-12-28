@@ -1,0 +1,314 @@
+# .github/workflows/tor_cdp_relay.yml
+# =====================================
+# FULL BROWSER RELAY - Puppeteer + Tor
+# 
+# This runs a REAL browser that can:
+# - Execute JavaScript fully
+# - Wait for AJAX/fetch calls to complete
+# - Search Ahmia and get REAL results
+# - Scrape any .onion site
+#
+name: Tor CDP Relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action: search, navigate, scrape, screenshot'
+        required: true
+        default: 'navigate'
+      url:
+        description: 'URL to visit OR search query (for search action)'
+        required: true
+      selector:
+        description: 'CSS selector to scrape (optional)'
+        required: false
+        default: ''
+      wait_ms:
+        description: 'Wait time in ms for JS to load'
+        required: false
+        default: '5000'
+      timeout:
+        description: 'Navigation timeout in seconds'
+        required: false
+        default: '60'
+
+jobs:
+  browser-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Install Tor
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tor
+          sudo service tor start
+          
+          echo "⏳ Waiting for Tor to bootstrap..."
+          for i in {1..30}; do
+            if curl --socks5-hostname 127.0.0.1:9050 -s --max-time 10 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
+              echo "✅ Tor is ready!"
+              curl --socks5-hostname 127.0.0.1:9050 -s http://check.torproject.org/api/ip
+              break
+            fi
+            echo "  Attempt $i/30..."
+            sleep 2
+          done
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
+        run: |
+          npm init -y
+          npm install puppeteer
+          echo "✅ Puppeteer installed"
+
+      - name: Execute Browser Task
+        env:
+          ACTION: ${{ github.event.inputs.action }}
+          TARGET_URL: ${{ github.event.inputs.url }}
+          SELECTOR: ${{ github.event.inputs.selector }}
+          WAIT_MS: ${{ github.event.inputs.wait_ms }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+        run: |
+          echo "🌐 Browser Task"
+          echo "   Action: $ACTION"
+          echo "   URL/Query: $TARGET_URL"
+          echo "   Selector: $SELECTOR"
+          echo "   Wait: ${WAIT_MS}ms"
+          echo "   Timeout: ${TIMEOUT}s"
+          echo ""
+          
+          node << 'NODEEOF'
+          const puppeteer = require('puppeteer');
+          
+          const AHMIA_URL = 'http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion';
+          
+          async function run() {
+            const action = process.env.ACTION;
+            const targetUrl = process.env.TARGET_URL;
+            const selector = process.env.SELECTOR || '';
+            const waitMs = parseInt(process.env.WAIT_MS) || 5000;
+            const timeoutSec = parseInt(process.env.TIMEOUT) || 60;
+            
+            console.log('🚀 Launching browser with Tor proxy...');
+            
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--proxy-server=socks5://127.0.0.1:9050'
+              ]
+            });
+            
+            const page = await browser.newPage();
+            
+            // Set realistic viewport and user agent
+            await page.setViewport({ width: 1920, height: 1080 });
+            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0');
+            
+            // Set timeout
+            page.setDefaultNavigationTimeout(timeoutSec * 1000);
+            page.setDefaultTimeout(timeoutSec * 1000);
+            
+            let result = {
+              action: action,
+              success: false,
+              timestamp: new Date().toISOString()
+            };
+            
+            try {
+              // ================================================================
+              // ACTION: SEARCH - Search Ahmia and get results
+              // ================================================================
+              if (action === 'search') {
+                console.log(`🔍 Searching Ahmia for: "${targetUrl}"`);
+                
+                // Navigate to Ahmia
+                await page.goto(AHMIA_URL, { waitUntil: 'networkidle2' });
+                console.log('   ✅ Ahmia loaded');
+                
+                // Find and fill search input
+                await page.waitForSelector('input[name="q"]', { timeout: 10000 });
+                await page.type('input[name="q"]', targetUrl);
+                console.log('   ✅ Search query entered');
+                
+                // Submit search
+                await Promise.all([
+                  page.waitForNavigation({ waitUntil: 'networkidle2' }),
+                  page.click('input[type="submit"]')
+                ]);
+                console.log('   ✅ Search submitted');
+                
+                // Wait extra time for JavaScript to render results
+                await new Promise(resolve => setTimeout(resolve, waitMs));
+                console.log(`   ✅ Waited ${waitMs}ms for JS`);
+                
+                // Extract search results
+                result.searchResults = await page.evaluate(() => {
+                  const results = [];
+                  
+                  // Try multiple selectors for Ahmia's result format
+                  const selectors = [
+                    '.result',
+                    '.search_result',
+                    'li[class*="result"]',
+                    '.results li',
+                    'article',
+                    '.item'
+                  ];
+                  
+                  for (const sel of selectors) {
+                    const items = document.querySelectorAll(sel);
+                    if (items.length > 0) {
+                      items.forEach(item => {
+                        const link = item.querySelector('a[href*=".onion"]') || item.querySelector('a');
+                        const titleEl = item.querySelector('h3, h4, h2, .title, strong, b');
+                        const snippetEl = item.querySelector('p, .snippet, .description, cite, small');
+                        
+                        if (link && link.href) {
+                          results.push({
+                            title: (titleEl?.textContent || link.textContent || '').trim().substring(0, 100),
+                            url: link.href,
+                            snippet: (snippetEl?.textContent || item.textContent || '').trim().substring(0, 300)
+                          });
+                        }
+                      });
+                      if (results.length > 0) break;
+                    }
+                  }
+                  
+                  // Fallback: get all .onion links
+                  if (results.length === 0) {
+                    document.querySelectorAll('a[href*=".onion"]').forEach(a => {
+                      results.push({
+                        title: a.textContent?.trim()?.substring(0, 100) || 'Unknown',
+                        url: a.href,
+                        snippet: a.closest('li, div, p')?.textContent?.trim()?.substring(0, 300) || ''
+                      });
+                    });
+                  }
+                  
+                  return results;
+                });
+                
+                result.resultsCount = result.searchResults.length;
+                result.searchUrl = page.url();
+                result.success = true;
+                
+                console.log(`   ✅ Found ${result.resultsCount} results`);
+              }
+              
+              // ================================================================
+              // ACTION: NAVIGATE - Go to URL and get page info
+              // ================================================================
+              else if (action === 'navigate') {
+                console.log(`🧭 Navigating to: ${targetUrl}`);
+                
+                await page.goto(targetUrl, { waitUntil: 'networkidle2' });
+                await new Promise(resolve => setTimeout(resolve, waitMs));
+                
+                result.url = page.url();
+                result.title = await page.title();
+                result.success = true;
+                
+                // Get all .onion links on page
+                result.onionLinks = await page.evaluate(() => {
+                  return Array.from(document.querySelectorAll('a[href*=".onion"]'))
+                    .map(a => ({ text: a.textContent?.trim(), href: a.href }))
+                    .slice(0, 50);
+                });
+                
+                console.log(`   ✅ Page loaded: ${result.title}`);
+              }
+              
+              // ================================================================
+              // ACTION: SCRAPE - Get page content or specific selector
+              // ================================================================
+              else if (action === 'scrape') {
+                console.log(`📄 Scraping: ${targetUrl}`);
+                if (selector) console.log(`   Selector: ${selector}`);
+                
+                await page.goto(targetUrl, { waitUntil: 'networkidle2' });
+                await new Promise(resolve => setTimeout(resolve, waitMs));
+                
+                result.url = page.url();
+                result.title = await page.title();
+                
+                if (selector) {
+                  // Scrape specific element
+                  try {
+                    result.content = await page.$eval(selector, el => el.innerHTML);
+                    result.text = await page.$eval(selector, el => el.textContent);
+                  } catch (e) {
+                    result.content = await page.content();
+                    result.selectorError = `Selector "${selector}" not found`;
+                  }
+                } else {
+                  // Get full page
+                  result.content = await page.content();
+                  result.text = await page.evaluate(() => document.body?.textContent?.trim());
+                }
+                
+                result.success = true;
+                console.log(`   ✅ Scraped ${result.content?.length || 0} chars`);
+              }
+              
+              // ================================================================
+              // ACTION: SCREENSHOT - Take visual screenshot
+              // ================================================================
+              else if (action === 'screenshot') {
+                console.log(`📸 Screenshot: ${targetUrl}`);
+                
+                await page.goto(targetUrl, { waitUntil: 'networkidle2' });
+                await new Promise(resolve => setTimeout(resolve, waitMs));
+                
+                result.url = page.url();
+                result.title = await page.title();
+                
+                const screenshot = await page.screenshot({ 
+                  encoding: 'base64',
+                  fullPage: false
+                });
+                result.screenshot = `data:image/png;base64,${screenshot}`;
+                result.success = true;
+                
+                console.log(`   ✅ Screenshot captured`);
+              }
+              
+              else {
+                result.error = `Unknown action: ${action}`;
+              }
+              
+            } catch (error) {
+              result.error = error.message;
+              result.stack = error.stack;
+              console.error(`❌ Error: ${error.message}`);
+            }
+            
+            await browser.close();
+            
+            // Output result
+            console.log('');
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify(result, null, 2));
+            console.log('======== RESULT END ========');
+          }
+          
+          run().catch(err => {
+            console.error('Fatal error:', err);
+            console.log('======== RESULT START ========');
+            console.log(JSON.stringify({ success: false, error: err.message }));
+            console.log('======== RESULT END ========');
+            process.exit(1);
+          });
+          NODEEOF
+
+      - name: Complete
+        run: echo "✅ Browser session completed"
