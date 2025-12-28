@@ -1,0 +1,57 @@
+# THE HOLY GRAIL: GitHub Actions as Tor Relay for Claude
+name: Tor Relay Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      onion_url:
+        description: 'Full .onion URL to fetch'
+        required: true
+        type: string
+      timeout:
+        description: 'Timeout in seconds'
+        required: false
+        default: '60'
+        type: string
+
+jobs:
+  fetch-onion:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Tor
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tor curl
+          
+      - name: Start Tor and wait for bootstrap
+        run: |
+          sudo service tor start
+          echo "Waiting for Tor to bootstrap..."
+          for i in {1..30}; do
+            if curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
+              echo "✅ Tor is ready!"
+              curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 2
+          done
+          
+      - name: Fetch .onion page
+        run: |
+          URL="${{ github.event.inputs.onion_url }}"
+          TIMEOUT="${{ github.event.inputs.timeout }}"
+          
+          echo "🧅 Fetching: $URL"
+          echo "⏱️ Timeout: ${TIMEOUT}s"
+          echo ""
+          
+          # Fetch the content
+          echo "======== CONTENT START ========"
+          curl --socks5-hostname 127.0.0.1:9050 \
+            -s \
+            --max-time "$TIMEOUT" \
+            -A "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/115.0" \
+            "$URL" | head -c 10000
+          echo ""
+          echo "======== CONTENT END ========"
