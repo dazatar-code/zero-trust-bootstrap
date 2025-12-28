@@ -29,72 +29,90 @@ jobs:
     steps:
       - name: Install Tor and Privoxy
         run: |
-          echo "🧅 Installing Tor + Privoxy (HTTP-to-SOCKS gateway)..."
+          echo "🧅 Installing Tor + Privoxy..."
           sudo apt-get update
           sudo apt-get install -y tor privoxy
           
-          # STOP Privoxy first (it auto-starts on install)
+          # STOP Privoxy (auto-starts on install)
           sudo service privoxy stop || true
           
-          # Configure Privoxy to forward ALL traffic to Tor SOCKS
-          # Must use proper config file location and syntax
-          sudo tee /etc/privoxy/config << 'PRIVOXY_CONFIG'
-          # Listen on localhost port 8118
-          listen-address  127.0.0.1:8118
-          
-          # Forward ALL requests through Tor SOCKS5
-          # The 't' means DNS resolution happens on Tor side (critical for .onion!)
-          forward-socks5t   /               127.0.0.1:9050 .
-          
-          # Allow all local connections
-          permit-access  127.0.0.1
-          
-          # Disable logging for speed
-          debug     0
-          PRIVOXY_CONFIG
-          
-          # Start Tor first
+          # Start Tor FIRST
           sudo service tor start
           
-          echo "⏳ Waiting for Tor bootstrap..."
-          for i in {1..45}; do
-            if curl -s --socks5-hostname 127.0.0.1:9050 --max-time 10 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
+          echo "⏳ Waiting for Tor bootstrap (up to 3 minutes)..."
+          for i in {1..90}; do
+            if curl -s --socks5-hostname 127.0.0.1:9050 --max-time 5 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
               echo "✅ Tor is ready!"
               curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip
               break
             fi
-            echo "  Attempt $i/45..."
+            # Also try fetching a simpler site
+            if curl -s --socks5-hostname 127.0.0.1:9050 --max-time 3 http://example.com 2>/dev/null | grep -q "Example"; then
+              echo "✅ Tor is working (example.com)"
+              break
+            fi
+            echo "  Waiting... ($i/90)"
             sleep 2
           done
           
-          # Now start Privoxy with correct config
-          echo ""
-          echo "🔧 Starting Privoxy gateway..."
-          sudo service privoxy start
-          sleep 2
+          # Configure Privoxy - COMPLETE config file
+          echo "🔧 Configuring Privoxy..."
+          sudo bash -c 'cat > /etc/privoxy/config << EOF
+confdir /etc/privoxy
+logdir /var/log/privoxy
+actionsfile match-all.action
+actionsfile default.action
+filterfile default.filter
+logfile logfile
+listen-address 127.0.0.1:8118
+toggle 1
+enable-remote-toggle 0
+enable-remote-http-toggle 0
+enable-edit-actions 0
+buffer-limit 4096
+forward-socks5t / 127.0.0.1:9050 .
+EOF'
           
-          # Verify Privoxy is running
-          if pgrep -x privoxy > /dev/null; then
-            echo "✅ Privoxy process running"
+          echo "🔧 Starting Privoxy..."
+          sudo service privoxy start
+          sleep 3
+          
+          # Verify Privoxy running
+          if pgrep privoxy > /dev/null; then
+            echo "✅ Privoxy process running (PID: $(pgrep privoxy))"
           else
-            echo "❌ Privoxy not running!"
-            sudo cat /var/log/privoxy/logfile 2>/dev/null || true
+            echo "❌ Privoxy failed to start!"
+            cat /var/log/privoxy/logfile 2>/dev/null | tail -20
             exit 1
           fi
           
-          # Verify Privoxy is forwarding through Tor
+          # Test Privoxy gateway - try multiple times
           echo ""
           echo "🔍 Testing Privoxy gateway..."
-          for i in {1..10}; do
-            RESULT=$(curl -s --proxy http://127.0.0.1:8118 --max-time 20 http://check.torproject.org/api/ip 2>&1)
-            if echo "$RESULT" | grep -q "IsTor"; then
-              echo "✅ Privoxy gateway working!"
-              echo "$RESULT"
+          GATEWAY_OK=false
+          for i in {1..15}; do
+            RESULT=$(curl -s --proxy http://127.0.0.1:8118 --max-time 15 http://example.com 2>&1)
+            if echo "$RESULT" | grep -q "Example Domain"; then
+              echo "✅ Privoxy gateway working! (via example.com)"
+              GATEWAY_OK=true
               break
             fi
-            echo "  Gateway test attempt $i/10..."
+            echo "  Attempt $i/15..."
             sleep 2
           done
+          
+          if [ "$GATEWAY_OK" = false ]; then
+            echo "⚠️ Gateway test via example.com failed, trying check.torproject.org..."
+            RESULT=$(curl -s --proxy http://127.0.0.1:8118 --max-time 30 http://check.torproject.org/api/ip 2>&1)
+            echo "Result: $RESULT"
+          fi
+          
+          echo ""
+          echo "📊 Status:"
+          echo "  Tor: $(pgrep tor > /dev/null && echo 'running' || echo 'NOT RUNNING')"
+          echo "  Privoxy: $(pgrep privoxy > /dev/null && echo 'running' || echo 'NOT RUNNING')"
+          echo "  Port 9050: $(netstat -tlnp 2>/dev/null | grep 9050 || echo 'not listening')"
+          echo "  Port 8118: $(netstat -tlnp 2>/dev/null | grep 8118 || echo 'not listening')"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
