@@ -41,36 +41,30 @@ jobs:
     steps:
       - name: Install and Start Tor
         run: |
-          # Install Tor
+          echo "🧅 Installing Tor..."
           sudo apt-get update
-          sudo apt-get install -y tor
+          sudo apt-get install -y tor curl
+          echo "✅ Tor installed"
           
-          # Create proper Tor config
-          echo "SOCKSPort 9050" | sudo tee /etc/tor/torrc
-          echo "DataDirectory /var/lib/tor" | sudo tee -a /etc/tor/torrc
-          echo "Log notice stdout" | sudo tee -a /etc/tor/torrc
+      - name: Wait for Tor Bootstrap
+        run: |
+          echo "🚀 Starting Tor service..."
+          sudo service tor start
           
-          # Ensure directories exist with correct permissions
-          sudo mkdir -p /var/lib/tor /var/log/tor
-          sudo chown -R debian-tor:debian-tor /var/lib/tor /var/log/tor
-          sudo chmod 700 /var/lib/tor
-          
-          # Start Tor directly (not via service)
-          echo "🚀 Starting Tor..."
-          sudo -u debian-tor tor &
-          TOR_PID=$!
-          
-          echo "⏳ Waiting for Tor to bootstrap (PID: $TOR_PID)..."
-          for i in {1..60}; do
-            if curl --socks5-hostname 127.0.0.1:9050 -s --max-time 5 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
-              echo "✅ Tor is ready!"
-              curl --socks5-hostname 127.0.0.1:9050 -s http://check.torproject.org/api/ip
+          echo "⏳ Waiting for Tor to bootstrap..."
+          for i in {1..45}; do
+            if curl -s --socks5-hostname 127.0.0.1:9050 \
+                 --max-time 10 \
+                 http://check.torproject.org/api/ip 2>/dev/null | grep -q "IsTor"; then
+              echo "✅ Tor is ready and connected!"
+              echo ""
+              echo "📍 Tor Exit Node:"
+              curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip
               exit 0
             fi
-            echo "  Attempt $i/60..."
-            sleep 2
+            echo "  Attempt $i/45..."
+            sleep 3
           done
-          
           echo "❌ Tor failed to bootstrap"
           exit 1
 
